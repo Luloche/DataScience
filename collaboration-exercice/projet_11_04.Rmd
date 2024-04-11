@@ -1,0 +1,452 @@
+---
+title: "Projet Data Sciences"
+author: "Paul Gradel; Axel Nicolas; Lucie Guenneugues"
+date: "2024-04-09"
+output: pdf_document
+---
+## Importation des packages
+
+Afin de mener à bien le projet, nous avons besoin de nombreux packages R.
+
+```{r}
+# Données
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+# Graphique
+library(ggplot2)
+library(rpart.plot)
+# Calculs
+library(corrplot)
+library(MLmetrics)
+# Modèles
+library(glmnet)
+library(keras)
+library(caret)
+library(rpart)
+library(e1071)
+library(gbm)
+library(randomForest)
+library(neuralnet)
+```
+```{r}
+data=read.csv("C:/Users/PC/OneDrive/Bureau/Axel/Master/S2/Data science/houses_Madrid.csv",sep=",")
+
+library(ggplot2)
+proportion=NULL
+for (i in 0:10){
+  proportion[i+1]= sum((100000*i<data$buy_price) & (data$buy_price<=100000*(i+1)))/length(data$buy_price)
+}
+c(proportion,sum(data$buy_price>1100000)/length(data$buy_price))
+proportion=proportion*100
+proportion
+```
+
+```{r}
+#récupération des district
+a=strsplit(data$neighborhood_id," ")
+indice=which(unlist(a)=="District")
+district=unlist(strsplit(unlist(a)[indice+1],":"))
+data$district=as.double(district)
+library(ggplot2)
+
+ggplot(data, aes(x = "", fill = as.factor(district))) +
+  geom_bar(stat = "count", width = 1, color = "white") +
+  coord_polar(theta = "y", start = 0) +
+  theme_void()
+
+```
+
+```{r}
+
+
+#Récupération des différents types de logement
+for (i in 1:length(data[,"house_type_id"])){
+  if (data$house_type_id[i]==''){
+    data$house_type_id[i]='Appartement'
+  } else {
+    id=as.numeric(gsub("\\D", "", data$house_type_id[i]))
+    if (id == 1) {
+      data$house_type_id[i]='Appartement'
+    } else if (id == 2) {
+      data$house_type_id[i]='Maison'
+    } else if (id == 3) {
+      data$house_type_id[i]='Studio'
+    } else if (id == 4) {
+      data$house_type_id[i]='Duplex'
+    } else if (id == 5) {
+      data$house_type_id[i]='Rooftop'
+    }
+  }
+}
+```
+
+```{r}
+#approximation des m^2 utilisables manquants
+type=unique(data$house_type_id)
+sous_bases=lapply(type, function(type) subset(data, house_type_id == type))
+diff_frequente=rep(0,5)
+mt_built_frequent=rep(0,5)
+for(i in 1:length(type)){
+  effectifs=sort(table(sous_bases[[i]]$sq_mt_built-sous_bases[[i]]$sq_mt_useful))
+  diff_frequente[i]=as.numeric(names(effectifs)[which.max(effectifs)])
+  effectifs2=sort(table(sous_bases[[i]]$sq_mt_built))
+  mt_built_frequent[i]=as.numeric(names(effectifs)[which.max(effectifs)])
+}
+
+for (i in 1:length(type)){
+  for (j in 1:length(data[,1])){
+    if (is.na(data$sq_mt_useful[j])==TRUE & data$house_type_id[j]==type[i]) {
+      data$sq_mt_useful[j]=data$sq_mt_built[j]-diff_frequente[i]
+    }
+    if (is.na(data$sq_mt_built[j])==TRUE & data$house_type_id[j]==type[i]){
+      data$sq_mt_built[j]=data$sq_mt_useful[j]+diff_frequente[i]
+    }
+    if(is.na(data$sq_mt_useful[j])==TRUE & is.na(data$sq_mt_built[j])==TRUE & data$house_type_id[j]==type[i]){
+      data$sq_mt_built[j]=mt_built_frequent[i]
+      data$sq_mt_useful[j]=data$sq_mt_built[j]-diff_frequente[i]
+    }
+  }
+}
+
+```
+
+```{r}
+#classification en 2 catégories des certificats d'énergie
+valeurs_exclues=c("A","B","C")
+for (i in 1:length(data$energy_certificate)) {
+  if (!(data$energy_certificate[i]%in%valeurs_exclues)) {
+    data$energy_certificate[i]=0
+  } else {
+    data$energy_certificate[i]=1
+  }
+}
+```
+
+```{r}
+#fonction true/false pour les colonnes qui nous intéressent
+tf=function(data){
+  for (i in 1:length(data)){
+    if(data[i]=='True'){
+      data[i]=1
+    }else{data[i]=0}
+  }
+  return(data)
+}
+
+colonnes_concernées=c("has_individual_heating","is_floor_under","is_renewal_needed","is_new_development","has_central_heating","has_ac","has_fitted_wardrobes","has_lift","is_exterior","has_garden","has_pool","has_terrace","has_balcony","has_storage_room","is_accessible","has_green_zones","has_parking","is_parking_included_in_price")
+data[,colonnes_concernées]=apply(data[,colonnes_concernées], 2, tf)
+
+```
+
+```{r}
+#récupération des étages le splus fréquents pr différents logements pr compléter les NA
+table=table(data$floor)
+plusfreq_ap=names(which.max(table))
+
+data_duplex=data[data$house_type_id=='Duplex',]
+table2=table(data_duplex$floor)
+plusfreq_dup=names(which.max(table2))#Résultat=Bajo->0
+
+data_roof=data[data$house_type_id=='Rooftop',]
+table3=table(data_roof$floor)
+plusfreq_roof=names(which.max(table3))
+
+```
+
+```{r}
+#entrée dans la base des variables rooftop et duplex afin de les mettre en type appart ds la colonne house_type_id
+is_duplex=c(data$house_type_id=='Duplex')*1
+is_rooftop=c(data$house_type_id=='Rooftop')*1
+house_type_id=c(data$house_type_id)
+
+data=cbind(data,house_type_id,is_duplex,is_rooftop)
+data$house_type_id=NULL
+```
+
+```{r}
+#on remplit avec les infos précédentes les étages manquants
+for (i in 1:length(data$floor)){
+  if(data$floor[i]=='Semi-sótano'||data$floor[i]=='Semi-sótano interior'||data$floor[i]=='Semi-sótano exterior'||data$floor[i]=='Sótano'||data$floor[i]=='Sótano interior'||data$floor[i]=='Sótano exterior'){
+    if(!(data$house_type_id[i]=='Duplex')){
+    data$floor[i]=-1
+    }
+  }
+  if(data$floor[i]=='Bajo'||data$floor[i]=='Entreplanta'||data$floor[i]=='Entreplanta interior'||data$floor[i]=='Entreplanta exterior'){
+    data$floor[i]=0
+  }
+  if(data$floor[i]==''){
+    if(data$house_type_id[i]=='Maison'||data$house_type_id[i]=='Duplex'){
+      data$floor[i]=0
+    }
+    if(data$house_type_id[i]=='Appartement'){
+      data$floor[i]=plusfreq_ap
+    }
+    if(data$house_type_id[i]=='Rooftop'){
+      data$floor[i]=plusfreq_roof
+    }
+  }
+}
+```
+
+```{r}
+#même opération avec les sdb
+data_duplex=data[data$house_type_id=='Duplex',]
+table4=table(data_duplex$n_bathrooms)
+sdbfreq_dup=names(which.max(table4))#Résultat=Bajo->0
+
+data_appart=data[data$house_type_id=='Appartement',]
+table5=table(data_appart$n_bathrooms)
+sdbfreq_appart=names(which.max(table5))
+
+data_maison=data[data$house_type_id=='Maison',]
+table6=table(data_maison$n_bathrooms)
+sdbfreq_maison=names(which.max(table6))
+
+
+#compteur=0
+#compteur2=0
+#for(i in 1:length(data$n_bathrooms)){
+#  if(data$house_type_id[i]=='Maison'){
+#   compteur=compteur+1
+#   compteur2=compteur2+as.numeric(data$n_bathrooms[i])
+#  }
+#}
+#moy_sdb_maison=compteur2/compteur
+#moy_sdb_maison
+
+for(i in 1:length(data$n_bathrooms)){
+  if(is.na(data$n_bathrooms[i])){
+    if(data$house_type_id[i]=='Appartement'){
+      data$n_bathrooms[i]=sdbfreq_appart
+    }
+    if(data$house_type_id[i]=='Maison'){
+      data$n_bathrooms[i]=sdbfreq_maison
+    }
+    if(data$house_type_id[i]=='Duplex'){
+      data$n_bathrooms[i]=sdbfreq_dup
+    }
+  }
+}
+
+#on remplace duplex et rooftop par appart
+for(i in 1:length(data$house_type_id)){
+  if(data$house_type_id[i]=='Duplex'||data$house_type_id[i]=='Rooftop'){
+    data$house_type_id[i]='Appartement'
+  }
+}
+```
+
+```{r}
+library(dplyr)
+lat_long=read.csv("C:/Users/PC/OneDrive/Bureau/Axel/Master/S2/Data science/Test2.txt")
+data$latitude=NULL
+data$longitude=NULL
+data=left_join(data, lat_long, by = "id")
+
+
+#exemple de base de données propre avec les colonnes traitées, il manque lat et long
+data_clean=data.frame(data$sq_mt_built,data$sq_mt_useful,data$n_rooms,data$n_bathrooms,data$latitude,data$longitude,data$floor,data$is_floor_under,data$neighborhood_id,data$operation,data$rent_price,data$buy_price,data$buy_price_by_area,data$is_renewal_needed,data$is_new_development,data$has_central_heating,data$has_individual_heating,data$has_ac,data$has_fitted_wardrobes,data$has_lift,data$is_exterior,data$has_garden,data$has_pool,data$has_terrace,data$has_balcony,data$has_storage_room,data$is_accessible,data$has_green_zones,data$energy_certificate,data$has_parking,data$is_parking_included_in_price,data$district,data$house_type_id,data$is_duplex,data$is_rooftop)
+names(data_clean)=gsub("^data\\.","",names(data_clean))
+summary(data_clean)
+View(data_clean)
+```
+
+```{r Création des Bases Test et Apprentissage}
+
+data_modelisation=data_clean[-c(5,6,9,10)] 
+
+#Séparation entre apprentissage et test
+
+set.seed(12345)
+perm=sample(1:nrow(data_modelisation), size=0.2*nrow(data_modelisation))
+donnees_test=data_modelisation[perm,] # Ensemble d'apprentissage
+donnees_train=data_modelisation[-perm,] # Ensemble Test
+
+```` 
+# Création d'un tableau afin de comparer les modèles:
+
+```{r Tableau de Comparaison}
+nom=c("Régression","Régression Pénalisée","Régression pénalisée","Forêt Aléatoire","XGBoosting")
+prevision=data.frame(matrix(0,ncol=length(nom),nrow=nrow(donnees_test)))
+names(prevision)=nom
+metriques=c("Corr","RMSE","MAE","MAPE")
+tableau_metriques=prevision[1:length(metriques),]
+rownames(tableau_metriques)=metriques
+```
+
+```{r fonction métriques}
+metriques=function(vec1,vec2){
+  cor=cor(vec1,vec2)
+  RMSE=sqrt(mean((vec1-vec2)^2))
+  MAE=mean(abs(vec1-vec2))
+  MAPE=mean(abs(vec1- vec2)/vec2)
+  return(round(c(cor,RMSE,MAE,MAPE),2))
+}
+```
+# Forêt Aléatoire
+
+retrait des lat et long car présence de NA et des neighborhood_id car on a les districts et operation car ce sont tous des Sales
+
+```{r Forêt Aléatoire}
+
+#foret=randomForest(buy_price ~ `sq_mt_built` + `sq_mt_useful` + `floor` + `district` + #`house_type_id`, data = donnees_train) 
+foret=randomForest(buy_price ~ ., data = donnees_train)
+
+summary(foret)
+prevforet=predict(foret,newdata=donnees_test)
+ 
+prevision[,"Forêt Aléatoire"]=prevforet
+tableau_metriques[,"Forêt Aléatoire"]=metriques(prevforet,donnees_test$buy_price)
+plot(donnees_test$buy_price,prevforet,col="violet",xlim=c(0,10^7),ylim=c(0,10^7))
+lines(donnees_test$buy_price,donnees_test$buy_price)
+ 
+plot(donnees_test$buy_price,prevforet,col="violet")
+lines(donnees_test$buy_price,donnees_test$buy_price)
+
+
+
+```
+Le code était très long a s'éxecuter avec toutes les variables donc j'ai tester avec certaines, les valeurs obtenues sont Corr : 0,90; RMSE=381931.26; MAE=208465.17; MAPE= 0.52
+En faisant avec tout voici ce qui est obtenu
+metrique$`Forêt Aléatoire`
+[1]     1.00 71576.50 15751.98     0.02
+
+Nous allons à présent passer à un modèle de régression, avec et sans pénalisation.
+
+Dans un premier temps, nous préparons la base de données à partir de la base clean.
+
+```{r}
+colonnes_non_utilisées=c('latitude','longitude','neighborhood_id','operation')
+data_mod=data_clean[, !(names(data_clean) %in% colonnes_non_utilisées)]
+colonnes_a_convertir=names(data_mod) != "house_type_id"
+data_mod[,colonnes_a_convertir]=apply(data_mod[,colonnes_a_convertir], 2, as.numeric)
+data_mod$house_type_id=as.factor(data_mod$house_type_id)
+
+```
+
+Nous utiliserons par la suite deux graphiques pour mieux visualiser la qualité de nos prédictions.
+
+```{R}
+# n premières prédictions comparées avec les valeurs réelles
+plot_pred = function(test, pred, n){
+  plot(test[1:n], type="l", main="Prédictions sur base test", ylab="Valeur foncière", xlab="Obs.", col="blue")
+  lines(pred[1:n], col="black", lty=2)
+  legend("topleft", legend=c("Valeurs réelles","Prédictions"), col=c("blue","black"), lty=c(1,2))
+}
+
+#Prédiction en fonction de la valeur réelle
+plot_check = function(test, pred, method){
+  plot(test, pred, ylim= c(0,2000000), xlab="Valeur réelle", ylab="Prédiction", col="blue", main=method)
+  lines(test,test,type="l",lwd=2)
+}
+```
+
+Nous pouvons à présent passer à la régression.
+
+```{r}
+#séparation de la base en deux bases de test et apprentissage
+sep_base=function(data){
+  ind_app=sample(1:nrow(data),0.75*nrow(data))
+  ind_test=setdiff(1:nrow(data),ind_app)
+  base_app=data[ind_app,]
+  base_test=data[ind_test,]
+  return(list("app"=base_app,"test"=base_test))
+}
+
+separation=sep_base(data_mod)
+base_app=separation$app #base d'apprentissage
+base_test=separation$test #base de test
+
+#régression linéaire
+reg=lm(buy_price~.,data=base_app)
+summary(reg)
+
+#prédiction sur la base de test
+pred_reg=predict(reg, base_test)
+
+#analyse des prédictions
+plot_pred(base_test$buy_price, pred_reg, 100)
+plot_check(base_test$buy_price,pred_reg,"Régression linéaire")
+
+#calcul des erreurs de la régression
+erreur_reg=metriques(pred_reg,base_test$buy_price)
+erreur_reg
+
+
+#étude des valeurs abberantes
+#récupération des résidus studentisés
+res_st = rstudent(reg)
+
+#visualisation des résidus 
+plot(reg$fitted.values, reg$residuals, col="blue", xlab="Fitted values", ylab="Résidus", main = "Résidus")
+abline(h = mean(reg$residuals), col="black")
+legend("bottomright", legend="Moyenne des résidus", lty=1, col="black")
+
+#visualtisation des résidus studentisés 
+plot(reg$fitted.values,res_st, xlab="Fitted values",ylab="Residus studentisées",col="blue")
+abline(h=5,col="black")
+abline(h=-5,col="black")
+title(main="Valeurs aberrantes")
+
+#analyse de la normalité
+plot(qnorm(seq(0,1,0.01)),quantile(res_st,probs=seq(0,1,0.01),na.rm=TRUE),type="b",col="blue",xlab="Quantile N(0,1)",ylab="Quantile des résidus studentisés",main="Analyse de la normalité")
+lines(qnorm(seq(0,1,0.01)),qnorm(seq(0,1,0.01)),col="black")
+legend("bottomright",legend="y=x",lty=1,col="black",cex=0.7)
+
+#pourcentage de résidus studentisés en dehors du cadre 
+pourcent=sum((abs(na.omit(res_st))>2))/nrow(base_app)
+pourcent
+
+```
+
+Après cette première régression, nous allons effectuer des régressions pénalisées avec les méthodes de Lasso et de Ridge.
+
+```{r}
+app2=model.matrix(base_app$buy_price~.,data=base_app)
+test2=model.matrix(base_test$buy_price~.,data=base_test)
+
+# Lasso 
+#coefficient de régularisation optimal
+reg_lasso=cv.glmnet(app2,base_app$buy_price,alpha=1)
+plot(reg_lasso)
+lasso.best=glmnet(app2,base_app$buy_price,alpha=1,lambda=reg_lasso$lambda.min)
+
+#prédiction sur la nouvelle base de test
+pred_lasso=predict(lasso.best,newx=test2)
+
+#analyse des prédictions
+plot_pred(base_test$buy_price,pred_lasso, 100)
+plot_check(base_test$buy_price,pred_lasso,"Lasso")
+
+#calcul des erreurs méthode Lasso
+erreur_lasso=metriques(pred_lasso, base_test$buy_price)
+erreur_lasso
+
+
+# Ridge 
+#à nouveau, on cherche le coefficient de régularisation optimal
+reg_ridge=cv.glmnet(app2,base_app$buy_price,alpha=0)
+plot(reg_ridge)
+ridge.best=glmnet(app2,base_app$buy_price,alpha=0,lambda=reg_ridge$lambda.min)
+
+#prédcition sur la nouvelle base de test
+pred_ridge = predict(ridge.best,newx=test2)
+
+#analyse des prédictions
+plot_pred(base_test$buy_price,pred_ridge, 100)
+plot_check(base_test$buy_price,pred_ridge,"Ridge")
+
+#calcul des erreurs avec la méthode Ridge
+erreur_ridge=metriques(pred_ridge,base_test$buy_price)
+erreur_ridge
+```
+
+Au final, nous obtenons les erreurs suivantes avec les différentes méthodes de régression :
+
+```{r}
+erreur_data_mod=data.frame("Regression"=erreur_reg,"Ridge"=erreur_ridge,"Lasso"=erreur_lasso)
+rownames(erreur_data_mod)=c('Cov','RMSE','MAE','MAPE')
+print(erreur_data_mod)
+```
